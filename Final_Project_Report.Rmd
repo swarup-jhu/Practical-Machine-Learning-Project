@@ -1,0 +1,444 @@
+---
+title: "Coursera Practical Machine Learning Project Report"
+author: "Swarup Kumar Roy"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+---
+
+```{r setup, include=FALSE}
+# Set global chunk options for reproducibility and cleaner output
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+
+# Introduction
+This is Practical Machine Learning Project Report for Coursera's Data Science Specialization Course offered by Johns Hopkins University.
+
+The goal of this project is to predict the manner in which participants performed barbell lifts, encoded as the `classe` variable in the training set.
+
+We train 4 models: **Decision Tree**, **Random Forest**, **Gradient Boosted Trees**, and **Support Vector Machine**, using k‑fold cross‑validation on the training set. We then evaluate performance on a validation subset randomly selected from the original training data to estimate **accuracy** and **out‑of‑sample error rate**.
+
+The `classe` variable has five levels (A–E) representing different forms of execution quality (perfect vs common mistakes). We use accelerometer and orientation features from multiple sensors to build the predictive model.
+
+In this report, we describe:
+- **How the model was built.**  
+- **How cross‑validation was used.**  
+- **What the expected out‑of‑sample error is.**  
+- **Why we chose Random Forest over simpler models.**  
+
+Finally, we use the trained model to predict 20 test cases for the Coursera quiz.
+
+
+# Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: 
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+(see the section on the Weight Lifting Exercise Dataset).
+
+
+Data :
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+
+The data for this project come from this source: 
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+---
+
+# 1. Environment Initialization & Parallel Setup
+
+To maximize computational efficiency and avoid memory bottlenecks during ensemble training, we initialize a parallel cluster across available CPU threads using `doParallel`.
+
+```{r init}
+# Package dependency checklist (including visualization engines)
+required_packages <- c(
+  "caret", "randomForest", "rpart", "rpart.plot", 
+  "corrplot", "parallel", "doParallel", "gbm"
+)
+
+# Install packages that are not already installed
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load required libraries
+library(caret)          # Training and model utilities
+library(randomForest)   # Random Forest implementation
+library(rpart)          # Decision tree (rpart)
+library(rpart.plot)     # Tree plotting
+library(corrplot)       # Correlation matrix visualization
+library(parallel)       # Detect CPU cores
+library(doParallel)     # Parallel backend for caret
+library(gbm)            # Gradient Boosting Machine
+
+# Set seed for deterministic reproducibility
+set.seed(12345)
+
+# Configure parallel computation (leave 1 core free for OS)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+```
+
+---
+
+# 2. Data Ingestion & Dimensional Analysis
+
+The training and test files are pulled directly from Coursera’s cloud storage.  
+Missing values, `#DIV/0!`, and blanks are treated as `NA`.
+
+```{r ingestion}
+
+train_data_url <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_data_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+train_data_file <- "./data/pml-training.csv"
+test_data_file  <- "./data/pml-testing.csv"
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+if (!file.exists(train_data_file)) {
+  download.file(train_data_url, destfile = train_data_file, method = "curl")
+}
+if (!file.exists(test_data_file)) {
+  download.file(test_data_url, destfile = test_data_file, method = "curl")
+}
+rm(train_data_url)
+rm(test_data_url)
+# Read raw CSV files
+training_raw <- read.csv("./data/pml-training.csv")
+testing_raw  <- read.csv("./data/pml-testing.csv")
+
+# Inspect dimensions of the raw training and testing data
+dim(training_raw)
+dim(testing_raw)
+```
+
+The raw training dataset has 19,622 observations across 160 columns, including:
+
+- Accelerometer, gyroscope, and magnetometer readings.  
+- Metadata (timestamps, user names, indices).  
+
+Our job is to use the relevant sensor features to predict `classe`.
+
+---
+
+# 3. Data Cleansing & Feature Engineering
+
+Feeding raw data into tree ensembles leads to memory overflows and high variance.  
+We apply three filters:
+
+- Remove columns with any missing values.  
+- Drop metadata columns that describe how data was collected, not the movement.  
+- Remove near‑zero‑variance (NZV) predictors.
+
+```{r cleansing}
+# 3.1 Drop columns containing any missing data
+na_counts <- colSums(is.na(training_raw))
+good_columns <- na_counts == 0
+train_clean <- training_raw[, good_columns]
+
+# 3.2 Remove metadata columns (first 7)
+train_clean <- train_clean[, -c(1:7)]
+
+# 3.3 Remove near-zero variance predictors
+nzv_metrics <- nearZeroVar(train_clean, saveMetrics = TRUE)
+train_clean <- train_clean[, !nzv_metrics$nzv]
+
+# Ensure target variable 'classe' is a factor
+train_clean$classe <- as.factor(train_clean$classe)
+
+# Final dimensionality of cleaned dataset
+dim(train_clean)
+```
+
+After cleaning, the dataset is reduced to 53 high‑quality accelerometer and orientation features, ready for modeling.
+
+## 3.1 Feature Correlation
+
+```{r plot2, fig.cap="Figure 2: Correlation Matrix of Top 20 Predictors", fig.align="center"}
+# Compute correlation matrix for first 20 numeric predictors
+corr_matrix <- cor(train_clean[, 1:20])
+
+# Plot correlation matrix as a heatmap
+corrplot(
+  corr_matrix,
+  method = "color",
+  type = "lower",
+  tl.cex = 0.6,
+  tl.col = "black",
+  main = "\\nFigure 2: Correlation Matrix of Top 20 Predictors"
+)
+```
+
+Random Forests are robust to multicollinearity, so we keep these features and let the model decide which combinations are most predictive.
+
+---
+
+# 4. Cross‑Validation Strategy
+
+To estimate out‑of‑sample error without using the unlabeled test file (`pml-testing.csv`), we split the cleaned training data into:
+
+- Local Training (75%): used for training the model.  
+- Local Validation (25%): used to evaluate performance.
+
+```{r splitting}
+# Stratified partition split (preserves class proportions)
+in_train  <- createDataPartition(train_clean$classe, p = 0.75, list = FALSE)
+local_train      <- train_clean[in_train, ]
+local_validation <- train_clean[-in_train, ]
+
+# Define common cross‑validation control (5‑fold CV, parallel enabled)
+fit_control <- trainControl(
+  method = "cv",
+  number = 5,
+  allowParallel = TRUE,
+  verboseIter = FALSE
+)
+```
+
+Within the Random Forest, GBM, and SVM training steps, we also use 5‑fold CV (`fit_control`), which further reduces sample bias and improves stability of the estimates.
+
+This two‑level strategy (train/validation split + internal CV) is our justification for why we trust the out‑of‑sample error estimate.
+
+---
+
+# 5. Model Building and Choice Justification
+
+We compare four approaches:
+
+- A Decision Tree (`rpart`), as a baseline.  
+- A Random Forest (`rf`), as our chosen final model.  
+- A Gradient Boosted Tree (`gbm`).  
+- A Support Vector Machine (`svmLinear`).
+
+## 5.1 Decision Tree (rpart) Performance
+
+```{r model_tree}
+# Train Decision tree model
+model_tree <- train(
+  classe ~ .,
+  data = local_train,
+  method = "rpart",
+  trControl = fit_control
+)
+
+# Predict on local validation and compute confusion matrix
+pred_tree <- predict(model_tree, newdata = local_validation)
+tree_cm <- confusionMatrix(pred_tree, local_validation$classe)
+tree_accuracy <- tree_cm$overall["Accuracy"]
+
+# Print confusion matrix and accuracy
+print(tree_cm)
+tree_accuracy
+
+# Plotting the model
+plot(model_tree)
+```
+
+The tree’s accuracy is low (~50–55%), confirming it generalizes poorly on this sensor‑data problem.
+
+### 5.1.1 Tree Visualization
+
+```{r plot3, fig.cap="Figure 3: Decision Tree Structure (rpart)", fig.align="center"}
+# Plot the final rpart tree structure
+rpart.plot(
+  model_tree$finalModel,
+  main = "Figure 3: Decision Tree Structure (rpart)",
+  type = 2,
+  fallen.leaves = TRUE,
+  cex = 0.6
+)
+```
+
+The tree is easy to interpret but typically achieves only ~50–55% accuracy on local validation, because single trees overfit and struggle with non‑linear, multi‑sensor patterns.
+
+## 5.2 Gradient Boosted Trees (GBM) Performance
+
+```{r model_gbm}
+# Train GBM model
+mod_gbm <- train(
+  classe ~ .,
+  data = local_train,
+  method = "gbm",
+  trControl = fit_control,
+  tuneLength = 5,
+  verbose = FALSE
+)
+```
+
+```{r gbm_eval}
+# Evaluate GBM Model
+pred_gbm <- predict(mod_gbm, local_validation)
+cmgbm <- confusionMatrix(pred_gbm, local_validation$classe)
+print(cmgbm)
+
+# Plot GBM results
+plot(mod_gbm)
+```
+Gradient Boosting builds trees sequentially, correcting errors from previous trees.  
+It often performs well on this dataset but is more sensitive to tuning and slower to train than Random Forest.
+
+## 5.3 Support Vector Machine (SVM) Performance
+
+```{r model_svm}
+# Train a linear SVM model
+mod_svm <- train(
+  classe ~ .,
+  data = local_train,
+  method = "svmLinear",
+  trControl = fit_control,
+  tuneLength = 5,
+  verbose = FALSE
+)
+```
+
+```{r svm_eval}
+# Evaluate SVM Model
+pred_svm <- predict(mod_svm, local_validation)
+cmsvm <- confusionMatrix(pred_svm, local_validation$classe)
+print(cmsvm)
+```
+
+Linear SVM tries to separate classes with hyperplanes; it is much less flexible than Random Forest on complex, non‑linear sensor data and usually underperforms here.
+
+## 5.4 Random Forest (rf) Performance
+
+```{r model_rf}
+# Train Random Forest model
+model_rf <- train(
+  classe ~ .,
+  data = local_train,
+  method = "rf",
+  trControl = fit_control,
+  ntree = 150
+)
+
+# Predict on local validation and compute confusion matrix
+pred_rf <- predict(model_rf, newdata = local_validation)
+conf_matrix_rf <- confusionMatrix(pred_rf, local_validation$classe)
+print(conf_matrix_rf)
+
+# Extract accuracy and out‑of‑sample error
+accuracy <- conf_matrix_rf$overall["Accuracy"]
+out_of_sample_error <- 1 - accuracy
+
+# Plot model
+plot(model_rf)
+```
+
+We chose Random Forest because:
+
+- It combines hundreds of trees (bagging), reducing variance and overfitting.  
+- At each split, it uses a random subset of features, which makes the ensemble robust to noisy sensor data.  
+- It handles non‑linear relationships and multicollinearity very well, which is ideal for accelerometer and gyroscope readings.
+
+---
+
+# 6. Accuracies and Out‑of‑Sample Errors
+
+We evaluate all models on the local validation set and compare their Expected Out‑of‑Sample Error Rates in a single table.
+
+```{r results_comparison, echo = FALSE}
+models <- c("Tree", "RF", "GBM", "SVM")
+
+# Tree accuracy
+cm_tree <- confusionMatrix(predict(model_tree, local_validation), local_validation$classe)
+
+# RF accuracy (our final model)
+cm_rf <- confusionMatrix(predict(model_rf, local_validation), local_validation$classe)
+
+# GBM and SVM accuracies were already computed above
+accuracy <- round(c(
+  cm_tree$overall['Accuracy'],
+  cm_rf$overall['Accuracy'],
+  cmgbm$overall['Accuracy'],
+  cmsvm$overall['Accuracy']
+), 3)
+
+# Corresponding out‑of‑sample errors
+oos_error <- 1 - accuracy
+
+# Display results table
+data.frame(
+  Accuracy = accuracy,
+  OOS_Error = oos_error,
+  row.names = models
+)
+```
+
+This table shows that:
+
+- Random Forest achieves the highest accuracy (>99%) and lowest out‑of‑sample error.  
+- Tree, GBM, and SVM follow at much lower performance levels.  
+
+This comparison clearly justifies why Random Forest is the best choice for this project.
+
+---
+
+# 7. Predicting 20 Test Cases
+
+We now use the final **Random Forest model** to predict the 20 unlabeled test cases.
+
+```{r prediction}
+# Match test columns to training columns (exclude 'classe')
+clean_test_columns <- names(train_clean)[names(train_clean) != "classe"]
+final_test_set <- testing_raw[, clean_test_columns]
+
+# Align data types between test and local_train columns
+for (col in names(final_test_set)) {
+    class(final_test_set[[col]]) <- class(local_train[[col]])
+}
+
+# Run final predictions on the cleaned test set
+final_quiz_predictions <- predict(model_rf, newdata = final_test_set)
+
+# Create submission‑style table (Problem_ID and predicted class)
+data.frame(
+  Problem_ID     = testing_raw$problem_id,
+  Predicted_Class = final_quiz_predictions
+)
+```
+
+These 20 predicted classes (`A`–`E`) are the answers for the Coursera 20‑question quiz.
+
+---
+
+# 8. Cleanup Environment
+
+```{r cleanup}
+# De‑allocate parallel cluster and revert to sequential backend
+stopCluster(cluster)
+registerDoSEQ()
+
+# Print confirmation message
+cat("\\nProcess complete. Parallel cluster closed successfully.\\n")
+```
+
+---
+
+# Conclusion
+
+- The goal of this project was to predict the manner in which participants performed barbell lifts, using the `classe` variable and the remaining sensor features.  
+- We cleaned the data thoroughly, removed missing and constant features, and kept only accelerometer‑based predictors.  
+- We used cross‑validation at two levels:
+  - A 75/25 train/validation split.  
+  - 5‑fold CV inside `caret` training.  
+- We compared four models:  
+  - Decision Tree (`rpart`).  
+  - Random Forest (`rf`).  
+  - Gradient Boosted Trees (`gbm`).  
+  - Linear SVM (`svmLinear`).  
+- Our final model is **Random Forest**, chosen because it:
+  - Handles non‑linear, high‑dimensional sensor data.  
+  - Is robust to noise and multicollinearity.  
+  - Delivers very high validation accuracy (>99%) and low out‑of‑sample error (~1%).  
+- Finally, we used this model to generate 20 predictions for the Coursera quiz.
